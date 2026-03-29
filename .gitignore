@@ -371,3 +371,6 @@ nul
 
 # Any local file
 *.local
+
+## module_bindings
+module_bindings/
