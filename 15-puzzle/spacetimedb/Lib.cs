@@ -4,6 +4,7 @@ public static partial class Module
 {
         // Room table - represents game sessions
     [SpacetimeDB.Table(Accessor = "Room", Public = true)]
+    [SpacetimeDB.Index.BTree(Accessor = "by_Players", Columns = new[] {nameof(CurrentPlayers), nameof(MaxPlayers)})]
     public partial struct Room
     {
         [SpacetimeDB.PrimaryKey]
@@ -30,6 +31,7 @@ public static partial class Module
 
         // Player table - represents players in rooms
     [SpacetimeDB.Table(Accessor = "Player", Public = true)]
+    [SpacetimeDB.Index.BTree(Accessor = "by_room", Columns = new[] { nameof(RoomId) })]
     public partial struct Player
     {
         [SpacetimeDB.PrimaryKey]
@@ -37,7 +39,8 @@ public static partial class Module
         public ulong PlayerId;
 
         public ulong RoomId;           // Foreign key to Room
-        public Identity UserId;       // Player's user identity
+        [SpacetimeDB.Unique]
+        public Identity UserId;       // Player's user identity (unique - one player per user)
         public string PlayerName;     // Display name
         public Timestamp EndTime;        // When the player finished the game (if applicable)
         public bool isReady;          // Is the player ready to start?
@@ -70,7 +73,14 @@ public static partial class Module
         public Identity PlayerId;      // Which player owns this board
         public string BoardState;      // Serialized game state (e.g., JSON)
         public Timestamp UpdatedAt;
+        public int MoveCount;           // Number of moves made by the player
         public bool IsCompleted;       // Has this player finished?
+    }
+    [SpacetimeDB.Type]
+    public partial struct TimeAndPlayerName
+    {
+        public double Time;
+        public string PlayerName;
     }
 
     [SpacetimeDB.Reducer]
@@ -103,6 +113,7 @@ public static partial class Module
             remainingNumbers |= (UInt16)(1 << tileNumber);
             tileOrder.Add(tileNumber);
         }
+        
 
         var newRoom = new Room
         {
@@ -134,7 +145,12 @@ public static partial class Module
         {
             throw new Exception("Room is full");
         }
-
+        
+        // Check if player is already in any room (UserId is unique, so Find is sufficient)
+        if(ctx.Db.Player.UserId.Find(userId) is Player existingPlayer)
+        {
+            throw new Exception("Player is already in a room");
+        }
 
         var newPlayer = new Player
         {
@@ -144,28 +160,44 @@ public static partial class Module
             isReady = false
         };
         ctx.Db.Player.Insert(newPlayer);
-        int currentPlayers = room.CurrentPlayers + 1;
-        // Update room's current player count using proper SpacetimeDB syntax
-        ctx.Db.Room.RoomId.Update(room with 
-        { 
-            CurrentPlayers = currentPlayers
-        });
-
-        // Auto-start game timer when room is full
-        if (currentPlayers >= room.MaxPlayers)
+       
+        int newCurrentPlayers = room.CurrentPlayers + 1;
+        
+        Log.Info($"Player {playerName} joined room {roomCode}. Current players: {newCurrentPlayers}/{room.MaxPlayers}");
+        
+        // Update room with current players count and optionally start time if full
+        if (newCurrentPlayers == room.MaxPlayers)
         {
-            StartGameCountdown(ctx, room.RoomId, 5); // Start game in 5 seconds when full
-        }
-
-        if (currentPlayers == room.MaxPlayers)
-        {
-            // Start the game when the room is full
+            // Room is now full - update both CurrentPlayers and StartTime in single operation
             ctx.Db.Room.RoomId.Update(room with 
             { 
+                CurrentPlayers = newCurrentPlayers,
                 StartTime = ctx.Timestamp
             });
             Log.Info($"Room {roomCode} is now full. Game starting!");
         }
+        else
+        {
+            // Room not full yet - just update CurrentPlayers
+            ctx.Db.Room.RoomId.Update(room with 
+            { 
+                CurrentPlayers = newCurrentPlayers
+            });
+        }
+        
+        var tileOrder = room.TileOrder;
+        
+        string tileOrderStr = string.Join(",", tileOrder);
+        //give player a game board with the initial tile order
+        ctx.Db.GameBoard.Insert(new GameBoard
+        {
+            RoomId = room.RoomId,
+            PlayerId = userId,
+            BoardState = tileOrderStr, 
+            UpdatedAt = ctx.Timestamp,
+            MoveCount = 0,
+            IsCompleted = false
+        });
 
 
     }
@@ -265,11 +297,13 @@ public static partial class Module
         
         if (existingBoard.HasValue)
         {
+            var moveCount = existingBoard.Value.MoveCount + 1; // Increment move count
             // Update existing board state for this player
             ctx.Db.GameBoard.BoardId.Update(existingBoard.Value with 
             {
                 BoardState = boardState,
-                UpdatedAt = ctx.Timestamp
+                UpdatedAt = ctx.Timestamp,
+                MoveCount = moveCount
             });
         }
         else
@@ -281,6 +315,7 @@ public static partial class Module
                 PlayerId = ctx.Sender,
                 BoardState = boardState,
                 UpdatedAt = ctx.Timestamp,
+                MoveCount = 1,
                 IsCompleted = false
             });
         }
@@ -366,6 +401,39 @@ public static partial class Module
             });
             Log.Info($"Game started in room {room.RoomCode}");
         }
+    }
+
+    //Get the difference in seconds between the players's end time and the room's start time
+    [SpacetimeDB.View(Accessor = "PlayerElapsedTime", Public = true)]
+    public static List<TimeAndPlayerName> GetPlayersElapsedTime(ViewContext ctx)
+    {
+        var result = new List<TimeAndPlayerName>();
+        if(ctx.Db.Player.UserId.Find(ctx.Sender) is not Player currentPlayer) // Ensure the player exists
+        {
+            return result;
+        }
+        if(ctx.Db.Room.RoomId.Find(currentPlayer.RoomId) is not Room room) // Ensure the room exists
+        {
+            return result;
+        }
+        var startTime = room.StartTime.MicrosecondsSinceUnixEpoch;
+        // Get all players in the same room and calculate their elapsed times
+        foreach (var roomPlayer in ctx.Db.Player.by_room.Filter(currentPlayer.RoomId))
+        {
+            // Only calculate for players who have finished (EndTime > 0)
+            if (roomPlayer.EndTime.MicrosecondsSinceUnixEpoch > 0)
+            {
+                var startTimeMs = startTime;
+                var endTimeMs = roomPlayer.EndTime.MicrosecondsSinceUnixEpoch;
+                var elapsedSeconds = (endTimeMs - startTimeMs) / 1000000.0; // Convert to seconds
+                result.Add(new TimeAndPlayerName
+                {
+                    Time = elapsedSeconds,
+                    PlayerName = roomPlayer.PlayerName
+                });
+            }
+        }
+        return result;
     }
 
 }
